@@ -14,7 +14,7 @@ from transformers import AutoTokenizer, BertForSequenceClassification, BertConfi
 from captum.attr import LayerIntegratedGradients
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_PATH      = "nov_25_combined.csv"
+DATA_PATH      = "dec_5_combined.csv"
 OUTPUT_DIR     = "heatmap_outputs"
 MAX_SAMPLES    = 100
 MODEL_VERSIONS = ["bert-uncased", "businessBERT", "bottleneckBERT"]
