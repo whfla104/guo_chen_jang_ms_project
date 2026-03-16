@@ -6,10 +6,11 @@ matplotlib.use('Agg')  # Non-interactive backend for saving images
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.colors import LinearSegmentedColormap
 
 import torch
 
-from transformers import BertTokenizer, BertForSequenceClassification, BertConfig
+from transformers import AutoTokenizer, BertForSequenceClassification, BertConfig
 from captum.attr import LayerIntegratedGradients
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -17,9 +18,31 @@ DATA_PATH      = "feb_20_combined.csv"
 OUTPUT_DIR     = "heatmap_outputs"
 MAX_SAMPLES    = 100
 MODEL_VERSIONS = ["bert-uncased", "businessBERT", "bottleneckBERT"]
+NUM_CLASSES    = 3          # <-- 3-class: stages 0, 1, 2
+
+HF_REPO_MAP = {
+    "bottleneckBERT": "colaguo/bottleneckBERT-3",
+    "businessBERT":   "colaguo/businessBERT-finetune-3",
+    "bert-uncased":   "colaguo/BERT-finetune-3",
+}
 
 device = torch.device("cpu")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Custom red-green-blue colormap ────────────────────────────────────────────
+# Negative attribution → red  (pushes toward class 0)
+# Near-zero            → green (pushes toward class 1)
+# Positive attribution → blue  (pushes toward class 2)
+RGB_CMAP = LinearSegmentedColormap.from_list(
+    "rgb_3class",
+    [
+        (0.0,  "#d62728"),   # red   — strong negative
+        (0.25, "#ff9896"),   # light red
+        (0.5,  "#2ca02c"),   # green — neutral / class 1
+        (0.75, "#aec7e8"),   # light blue
+        (1.0,  "#1f77b4"),   # blue  — strong positive
+    ],
+)
 
 # ── Caches ────────────────────────────────────────────────────────────────────
 MODEL_CACHE = {}
@@ -30,17 +53,22 @@ TOKEN_IDS   = {}
 def load_model(version):
     if (version, "model") in MODEL_CACHE:
         return
-    name = f"colaguo/{version}_finetune_feb24"
+    name = HF_REPO_MAP[version]
     print(f"Loading {name} ...")
 
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
     config    = BertConfig.from_pretrained(name)
-    tokenizer = BertTokenizer.from_pretrained(name)
+    tokenizer = AutoTokenizer.from_pretrained(name)
 
-    ckpt_path  = hf_hub_download(repo_id=name, filename="model.safetensors")
-    state_dict = load_file(ckpt_path, device=str(device))
+    try:
+        ckpt_path  = hf_hub_download(repo_id=name, filename="model.safetensors")
+        state_dict = load_file(ckpt_path, device=str(device))
+    except Exception:
+        print(f"  model.safetensors not found, falling back to pytorch_model.bin")
+        ckpt_path  = hf_hub_download(repo_id=name, filename="pytorch_model.bin")
+        state_dict = torch.load(ckpt_path, map_location=device)
 
     # Some checkpoints were trained with a custom vocab size — read it directly
     # from the saved weights so the model architecture matches exactly.
@@ -50,6 +78,9 @@ def load_model(version):
         if ckpt_vocab_size != config.vocab_size:
             print(f"  Patching vocab size: config={config.vocab_size} -> checkpoint={ckpt_vocab_size}")
             config.vocab_size = ckpt_vocab_size
+
+    # Override num_labels to match 3-class setup
+    config.num_labels = NUM_CLASSES
 
     model = BertForSequenceClassification(config)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -95,6 +126,11 @@ def predict(input_ids, version):
 
 # ── Attribution ───────────────────────────────────────────────────────────────
 def get_attributions(text, target_class, version):
+    """
+    Compute integrated gradients w.r.t. target_class (0, 1, or 2).
+    Positive attribution → token supports target_class.
+    Negative attribution → token pushes away from target_class.
+    """
     inp, ref = build_input_ref(text, version)
     attn     = torch.ones_like(inp)
     tokens   = get_tokens(inp, version)
@@ -111,14 +147,21 @@ def get_attributions(text, target_class, version):
     attrs_norm = (attrs_sum / norm) if norm > 1e-6 else torch.zeros_like(attrs_sum)
     return tokens, attrs_norm.detach().numpy()
 
+# ── Class label helper ────────────────────────────────────────────────────────
+STAGE_LABELS = {0: "Stage 0", 1: "Stage 1", 2: "Stage 2"}
+
+def class_label(cls_idx):
+    return STAGE_LABELS.get(int(cls_idx), str(cls_idx))
+
 # ── Paragraph-style panel renderer ───────────────────────────────────────────
 def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, true_class):
     """
     Renders tokens as a flowing paragraph of highlighted text.
-    Each token gets a coloured background (red = towards predicted, blue = away)
-    and the text flows naturally left-to-right, wrapping like a real paragraph.
+      Red   = strong negative attribution (pushes toward Stage 0)
+      Green = near-zero / neutral         (Stage 1 territory)
+      Blue  = strong positive attribution (pushes toward Stage 2)
     """
-    cmap = plt.cm.RdBu_r
+    cmap = RGB_CMAP
     vmax = max(np.abs(attributions).max(), 1e-6)
     norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
 
@@ -128,7 +171,11 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
     ax.set_facecolor("#f7f7f7")
 
     # Title
-    title = f"{version}   |   Predicted: {pred_class}   |   True label: {true_class}"
+    title = (
+        f"{version}   |   "
+        f"Predicted: {class_label(pred_class)}   |   "
+        f"True label: {class_label(true_class)}"
+    )
     ax.text(0.01, 0.975, title,
             transform=ax.transAxes,
             fontsize=10, fontweight="bold",
@@ -149,7 +196,7 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
                 if tok not in ("[PAD]", "[CLS]", "[SEP]", "")]
 
     # Pre-split tokens into lines by cumulative character count
-    lines       = []
+    lines        = []
     current_line = []
     current_len  = 0
     for tok, atr in filtered:
@@ -166,8 +213,8 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
 
     # Trim to however many lines actually fit
     max_lines = int((Y_START - 0.08) / LINE_H)
-    truncated = len(lines) > max_lines
-    lines = lines[:max_lines]
+    truncated  = len(lines) > max_lines
+    lines      = lines[:max_lines]
 
     for line_idx, line_tokens in enumerate(lines):
         y = Y_START - line_idx * LINE_H
@@ -213,8 +260,10 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax, orientation="horizontal",
                         fraction=0.03, pad=0.01, aspect=50)
-    cbar.set_label("<-- away from predicted class          towards predicted class -->",
-                   fontsize=7)
+    cbar.set_label(
+        "← Stage 0 (red)          Stage 1 / neutral (green)          Stage 2 (blue) →",
+        fontsize=7,
+    )
     cbar.ax.tick_params(labelsize=6)
 
 
@@ -230,7 +279,6 @@ def save_combined(all_model_data, sample_idx):
                              facecolor="white")
     if n == 1:
         axes = [axes]
-
 
     for ax, (tokens, attrs, version, pred_cls, true_cls) in zip(axes, all_model_data):
         render_paragraph_panel(fig, ax, tokens, attrs, version, pred_cls, true_cls)
@@ -249,6 +297,12 @@ def main():
     df = pd.read_csv(DATA_PATH)
     print(f"Loaded {len(df)} rows from {DATA_PATH}")
 
+    # Validate labels are 0/1/2
+    unique_labels = df["label"].unique()
+    print(f"Unique labels in dataset: {sorted(unique_labels)}")
+    assert set(unique_labels).issubset({0, 1, 2, 0.0, 1.0, 2.0}), \
+        f"Expected labels {{0,1,2}}, got {unique_labels}"
+
     for v in MODEL_VERSIONS:
         load_model(v)
 
@@ -261,7 +315,7 @@ def main():
 
         preds = {}
         for v in MODEL_VERSIONS:
-            inp, _    = build_input_ref(text, v)
+            inp, _      = build_input_ref(text, v)
             preds[v], _ = predict(inp, v)
 
         bottleneck_ok = preds.get("bottleneckBERT") == label
@@ -269,7 +323,7 @@ def main():
 
         if bottleneck_ok and others_wrong:
             found += 1
-            print(f"\n-- Sample {found} (df row {row_idx})  label={label} --")
+            print(f"\n-- Sample {found} (df row {row_idx})  label={class_label(label)} --")
 
             panel_data = []
             for v in MODEL_VERSIONS:
@@ -277,7 +331,7 @@ def main():
                 pred_cls, _   = predict(inp, v)
                 tokens, attrs = get_attributions(text, label, v)
                 panel_data.append((tokens, attrs, v, pred_cls, label))
-                print(f"  {v:20s}  pred={pred_cls}")
+                print(f"  {v:20s}  pred={class_label(pred_cls)}")
 
             fpath = save_combined(panel_data, found)
             print(f"  -> {fpath}")
