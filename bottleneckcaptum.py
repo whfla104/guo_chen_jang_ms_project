@@ -4,9 +4,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for saving images
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from matplotlib.patches import FancyBboxPatch
-from matplotlib.colors import LinearSegmentedColormap
 
 import torch
 
@@ -14,9 +12,10 @@ from transformers import AutoTokenizer, BertForSequenceClassification, BertConfi
 from captum.attr import LayerIntegratedGradients
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_PATH      = "dec_5_combined.csv"
-OUTPUT_DIR     = "heatmap_outputs"
+DATA_PATH      = "dec13_combined.csv"
+OUTPUT_DIR     = "heatmap_outputs_st_2"
 MAX_SAMPLES    = 100
+MAX_PER_CLASS  = 34    # collect exactly this many per stage (34×3 = 102, stops at 100)
 MODEL_VERSIONS = ["bert-uncased", "businessBERT", "bottleneckBERT"]
 NUM_CLASSES    = 3          # <-- 3-class: stages 0, 1, 2
 
@@ -29,20 +28,34 @@ HF_REPO_MAP = {
 device = torch.device("cpu")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ── Custom red-green-blue colormap ────────────────────────────────────────────
-# Negative attribution → red  (pushes toward class 0)
-# Near-zero            → green (pushes toward class 1)
-# Positive attribution → blue  (pushes toward class 2)
-RGB_CMAP = LinearSegmentedColormap.from_list(
-    "rgb_3class",
-    [
-        (0.0,  "#d62728"),   # red   — strong negative
-        (0.25, "#ff9896"),   # light red
-        (0.5,  "#2ca02c"),   # green — neutral / class 1
-        (0.75, "#aec7e8"),   # light blue
-        (1.0,  "#1f77b4"),   # blue  — strong positive
-    ],
-)
+MAX_SEQ_LEN = 512   # BERT hard limit
+
+# ── RGB triangle color mixing ─────────────────────────────────────────────────
+# Class 0 → red   (1, 0, 0)
+# Class 1 → green (0, 1, 0)
+# Class 2 → blue  (0, 0, 1)
+CLASS_COLORS = np.array([
+    [0.84, 0.15, 0.16],   # red
+    [0.17, 0.63, 0.17],   # green
+    [0.12, 0.47, 0.71],   # blue
+], dtype=np.float32)
+
+def weights_to_rgb(weights):
+    """
+    weights: (n_tokens, 3) non-negative floats, already normalised per token.
+    Returns (n_tokens, 3) RGB array in [0, 1].
+    Blends the three class colours by attribution weight.
+    Tokens with near-zero total attribution get a neutral grey.
+    """
+    total  = weights.sum(axis=1, keepdims=True)
+    safe   = np.where(total > 1e-6, total, 1.0)
+    w_norm = weights / safe                        # (n, 3) — rows sum to 1
+    rgb    = w_norm @ CLASS_COLORS                 # (n, 3)
+    # fade toward grey for low-attribution tokens
+    grey   = np.full_like(rgb, 0.88)
+    alpha  = np.clip(total / (total.max() + 1e-6), 0, 1)
+    rgb    = alpha * rgb + (1 - alpha) * grey
+    return np.clip(rgb, 0, 1)
 
 # ── Caches ────────────────────────────────────────────────────────────────────
 MODEL_CACHE = {}
@@ -107,6 +120,7 @@ def load_model(version):
 def build_input_ref(text, version):
     tok = MODEL_CACHE[(version, "tokenizer")]
     ids = tok.encode(text, add_special_tokens=False)
+    ids = ids[: MAX_SEQ_LEN - 2]          # leave room for [CLS] and [SEP]
     t   = TOKEN_IDS[version]
     inp = torch.tensor([[t["cls"]] + ids + [t["sep"]]], device=device)
     ref = torch.tensor([[t["cls"]] + [t["ref"]] * len(ids) + [t["sep"]]], device=device)
@@ -125,27 +139,34 @@ def predict(input_ids, version):
     return torch.argmax(probs).item(), probs
 
 # ── Attribution ───────────────────────────────────────────────────────────────
-def get_attributions(text, target_class, version):
+def get_attributions(text, version):
     """
-    Compute integrated gradients w.r.t. target_class (0, 1, or 2).
-    Positive attribution → token supports target_class.
-    Negative attribution → token pushes away from target_class.
+    Compute integrated gradients for all 3 classes independently.
+    Returns:
+      tokens      : list of str
+      rgb_weights : (n_tokens, 3) array of non-negative attribution magnitudes,
+                    one column per class (0=red, 1=green, 2=blue).
     """
     inp, ref = build_input_ref(text, version)
     attn     = torch.ones_like(inp)
     tokens   = get_tokens(inp, version)
+    lig      = LIG_CACHE[version]
 
-    lig = LIG_CACHE[version]
-    attrs, _ = lig.attribute(
-        inputs=inp,
-        baselines=ref,
-        additional_forward_args=(attn, target_class, version),
-        return_convergence_delta=True,
-    )
-    attrs_sum  = attrs.sum(dim=-1).squeeze(0)
-    norm       = torch.norm(attrs_sum)
-    attrs_norm = (attrs_sum / norm) if norm > 1e-6 else torch.zeros_like(attrs_sum)
-    return tokens, attrs_norm.detach().numpy()
+    per_class = []
+    for cls_idx in range(NUM_CLASSES):
+        attrs, _ = lig.attribute(
+            inputs=inp,
+            baselines=ref,
+            additional_forward_args=(attn, cls_idx, version),
+            return_convergence_delta=True,
+        )
+        attrs_sum = attrs.sum(dim=-1).squeeze(0)          # (seq_len,)
+        # keep only positive contributions for this class
+        positive  = torch.clamp(attrs_sum, min=0).detach().numpy()
+        per_class.append(positive)
+
+    rgb_weights = np.stack(per_class, axis=1)             # (seq_len, 3)
+    return tokens, rgb_weights
 
 # ── Class label helper ────────────────────────────────────────────────────────
 STAGE_LABELS = {0: "Stage 0", 1: "Stage 1", 2: "Stage 2"}
@@ -154,16 +175,15 @@ def class_label(cls_idx):
     return STAGE_LABELS.get(int(cls_idx), str(cls_idx))
 
 # ── Paragraph-style panel renderer ───────────────────────────────────────────
-def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, true_class):
+def render_paragraph_panel(fig, ax, tokens, rgb_weights, version, pred_class, true_class):
     """
     Renders tokens as a flowing paragraph of highlighted text.
-      Red   = strong negative attribution (pushes toward Stage 0)
-      Green = near-zero / neutral         (Stage 1 territory)
-      Blue  = strong positive attribution (pushes toward Stage 2)
+    Each token's background is a blend of red / green / blue proportional
+    to its positive attribution toward Stage 0 / 1 / 2 respectively.
+    Pure grey = no strong attribution to any class.
     """
-    cmap = RGB_CMAP
-    vmax = max(np.abs(attributions).max(), 1e-6)
-    norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    # Compute per-token RGB colours
+    colors_rgb = weights_to_rgb(rgb_weights)   # (n_tokens, 3)
 
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
@@ -182,36 +202,51 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
             va="top", ha="left", color="#111111",
             fontfamily="monospace")
 
-    # Layout constants — monospace so every char is the same width
+    # Legend patches (top-right)
+    for i, (label_str, color) in enumerate(
+        zip(["Stage 0", "Stage 1", "Stage 2"], CLASS_COLORS)
+    ):
+        bx = 0.75 + i * 0.08
+        rect = FancyBboxPatch((bx, 0.955), 0.06, 0.03,
+                              boxstyle="round,pad=0.001", linewidth=0,
+                              facecolor=color, transform=ax.transAxes)
+        ax.add_patch(rect)
+        ax.text(bx + 0.03, 0.97, label_str,
+                transform=ax.transAxes, fontsize=7,
+                va="center", ha="center", color="white", fontweight="bold")
+
+    # Layout constants
     FONT_SIZE      = 9
-    CHARS_PER_LINE = 100        # wrap after this many characters
-    LINE_H         = 0.055      # axes-fraction height per text line
+    CHARS_PER_LINE = 100
+    LINE_H         = 0.055
     X_START        = 0.01
-    Y_START        = 0.91       # start just below the title
+    Y_START        = 0.91
     CHAR_W         = (1.0 - X_START * 2) / CHARS_PER_LINE
-    PAD_Y          = 0.006      # vertical inner padding for highlight boxes
+    PAD_Y          = 0.006
 
     # Filter out special / padding tokens
-    filtered = [(tok, atr) for tok, atr in zip(tokens, attributions)
-                if tok not in ("[PAD]", "[CLS]", "[SEP]", "")]
+    filtered = [
+        (tok, col)
+        for tok, col in zip(tokens, colors_rgb)
+        if tok not in ("[PAD]", "[CLS]", "[SEP]", "")
+    ]
 
-    # Pre-split tokens into lines by cumulative character count
+    # Wrap into lines
     lines        = []
     current_line = []
     current_len  = 0
-    for tok, atr in filtered:
-        tok_len = len(tok) + 1   # +1 for the trailing space
+    for tok, col in filtered:
+        tok_len = len(tok) + 1
         if current_len + tok_len > CHARS_PER_LINE and current_line:
             lines.append(current_line)
-            current_line = [(tok, atr)]
+            current_line = [(tok, col)]
             current_len  = tok_len
         else:
-            current_line.append((tok, atr))
+            current_line.append((tok, col))
             current_len += tok_len
     if current_line:
         lines.append(current_line)
 
-    # Trim to however many lines actually fit
     max_lines = int((Y_START - 0.08) / LINE_H)
     truncated  = len(lines) > max_lines
     lines      = lines[:max_lines]
@@ -220,11 +255,9 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
         y = Y_START - line_idx * LINE_H
         x = X_START
 
-        for tok, attr in line_tokens:
-            tok_w = len(tok) * CHAR_W          # width of the token text
-            box_w = tok_w + CHAR_W * 0.5       # a little extra so highlights touch
-
-            color = cmap(norm(attr))
+        for tok, color in line_tokens:
+            tok_w = len(tok) * CHAR_W
+            box_w = tok_w + CHAR_W * 0.5
 
             rect = FancyBboxPatch(
                 (x, y - LINE_H + PAD_Y),
@@ -248,29 +281,18 @@ def render_paragraph_panel(fig, ax, tokens, attributions, version, pred_class, t
                     color="black",
                     clip_on=True)
 
-            x += tok_w + CHAR_W   # token width + one space gap
+            x += tok_w + CHAR_W
 
     if truncated:
         trunc_y = Y_START - len(lines) * LINE_H - 0.01
         ax.text(X_START, trunc_y, "... (truncated)",
                 transform=ax.transAxes, fontsize=7, color="#888888")
 
-    # Colour bar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, orientation="horizontal",
-                        fraction=0.03, pad=0.01, aspect=50)
-    cbar.set_label(
-        "← Stage 0 (red)          Stage 1 / neutral (green)          Stage 2 (blue) →",
-        fontsize=7,
-    )
-    cbar.ax.tick_params(labelsize=6)
-
 
 # ── Stitch all 3 panels into one PNG ─────────────────────────────────────────
 def save_combined(all_model_data, sample_idx):
     """
-    all_model_data: list of (tokens, attributions, version, pred_class, true_class)
+    all_model_data: list of (tokens, rgb_weights, version, pred_class, true_class)
     Renders one panel per model, stitched vertically, saved as a single PNG.
     """
     n = len(all_model_data)
@@ -303,6 +325,19 @@ def main():
     assert set(unique_labels).issubset({0, 1, 2, 0.0, 1.0, 2.0}), \
         f"Expected labels {{0,1,2}}, got {unique_labels}"
 
+    # Pre-stratify: take up to N rows per class so the search is balanced.
+    # Stage 2 gets more rows because bottleneckBERT-wins are rarer there.
+    CLASS_BUDGET = {0: 20, 1: 20, 2: 400}
+    df = (
+        df.groupby("label", group_keys=False)
+          .apply(lambda g: g.sample(n=min(len(g), CLASS_BUDGET[int(g.name)]),
+                                    random_state=42))
+          .reset_index(drop=True)
+          .sample(frac=1, random_state=42)   # shuffle the interleaved result
+          .reset_index(drop=True)
+    )
+    print(f"Stratified pool: {dict(df['label'].value_counts().sort_index())}")
+
     for v in MODEL_VERSIONS:
         load_model(v)
 
@@ -327,10 +362,10 @@ def main():
 
             panel_data = []
             for v in MODEL_VERSIONS:
-                inp, _        = build_input_ref(text, v)
-                pred_cls, _   = predict(inp, v)
-                tokens, attrs = get_attributions(text, label, v)
-                panel_data.append((tokens, attrs, v, pred_cls, label))
+                inp, _          = build_input_ref(text, v)
+                pred_cls, _     = predict(inp, v)
+                tokens, rgb_w   = get_attributions(text, v)
+                panel_data.append((tokens, rgb_w, v, pred_cls, label))
                 print(f"  {v:20s}  pred={class_label(pred_cls)}")
 
             fpath = save_combined(panel_data, found)
